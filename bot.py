@@ -255,13 +255,13 @@ class Teams:
                 pass
 
     def read_messages(self) -> list[dict]:
-        try:
-            msgs = self.page.evaluate(
-                EXTRACT_MESSAGES_JS, self.cfg.teams_message_selectors
-            )
-        except PlaywrightError as exc:
-            self.log.debug("read_messages failed: %s", exc)
-            return []
+        """Collect messages from the page and every iframe inside it."""
+        msgs: list[dict] = []
+        for frame in self.page.frames:
+            try:
+                msgs.extend(frame.evaluate(EXTRACT_MESSAGES_JS, self.cfg.teams_message_selectors))
+            except PlaywrightError as exc:
+                self.log.debug("read_messages failed in a frame: %s", str(exc).splitlines()[0])
         for m in msgs:
             m["key"] = stable_key(m)
         return msgs
@@ -340,6 +340,7 @@ class CourseSite:
         self.cfg = cfg
         self.log = log
         self.ack_re = re.compile(cfg.ack_button_pattern, re.IGNORECASE)
+        self.course_url = cfg.course_url
         self.page.on("dialog", lambda d: d.accept())
 
     def open(self) -> None:
@@ -352,7 +353,7 @@ class CourseSite:
         except PlaywrightError as exc:
             self.log.warning("Course page reload failed (%s); opening the URL again.", exc)
             try:
-                self.page.goto(self.cfg.course_url, wait_until="domcontentloaded")
+                self.page.goto(self.course_url, wait_until="domcontentloaded")
             except PlaywrightError as exc2:
                 self.log.error("Could not open course page: %s", exc2)
 
@@ -372,18 +373,26 @@ class CourseSite:
             return False
         return "upcoming sessions" in body
 
+    def adopt_current_url(self) -> None:
+        """Remember the tab's URL as the course page once it is showing."""
+        url = self.page.url
+        if url and url != self.course_url and "lmt" in url.lower():
+            self.course_url = url
+            self.log.info("Using the course page the tab is on now: %s", url)
+
     def wait_until_ready(self) -> None:
         last_nag = 0.0
         while True:
             if self.looks_ready():
+                self.adopt_current_url()
                 self.log.info("Course page is loaded.")
                 return
             if time.time() - last_nag > 30:
                 alert_user(
                     self.log,
-                    "Course page is not showing 'Upcoming Sessions'. "
-                    "If the second tab asks you to sign in, do that now, "
-                    "then open the course page in that same tab.",
+                    "Course page is not showing 'Upcoming Sessions'. In the second tab, "
+                    "sign in to the LMT site and open your course page (the one with the "
+                    "Join buttons). The bot will carry on by itself once it sees it.",
                 )
                 last_nag = time.time()
             time.sleep(3)
@@ -495,16 +504,82 @@ def launch_browser(p, cfg: Config, log: logging.Logger) -> BrowserContext:
     return p.chromium.launch_persistent_context(**common)
 
 
+# Compact description of a page: which data-tid values exist, what the
+# ancestors of timestamps and text boxes look like, and the visible text.
+# Small enough to paste into a chat, unlike the full HTML.
+PAGE_MAP_JS = """
+() => {
+  const desc = el => {
+    let s = el.tagName.toLowerCase();
+    if (el.id) s += '#' + String(el.id).slice(0, 40);
+    for (const a of ['data-tid', 'role', 'aria-label', 'data-testid', 'contenteditable', 'name']) {
+      const v = el.getAttribute && el.getAttribute(a);
+      if (v) s += ' [' + a + '=' + v.slice(0, 60) + ']';
+    }
+    if (typeof el.className === 'string' && el.className)
+      s += ' .' + el.className.trim().split(/\\s+/).slice(0, 3).join('.').slice(0, 70);
+    return s;
+  };
+  const chain = el => {
+    const out = []; let e = el;
+    for (let i = 0; i < 12 && e && e !== document.body; i++) { out.push(desc(e)); e = e.parentElement; }
+    return out;
+  };
+  const L = [];
+  L.push('URL: ' + location.href);
+  L.push('TITLE: ' + document.title);
+  const tids = {};
+  document.querySelectorAll('[data-tid]').forEach(e => { const t = e.getAttribute('data-tid'); tids[t] = (tids[t] || 0) + 1; });
+  L.push('', '== data-tid values (count) ==');
+  Object.entries(tids).sort((a, b) => b[1] - a[1]).forEach(([k, v]) => L.push(v + '\\t' + k));
+  L.push('', '== time[datetime] elements: ancestor chain (first 4) ==');
+  Array.from(document.querySelectorAll('time[datetime]')).slice(0, 4).forEach((t, i) => {
+    L.push('-- time #' + i + ' datetime=' + t.getAttribute('datetime') + ' text=' + (t.innerText || '').slice(0, 30));
+    chain(t).forEach(c => L.push('   ' + c));
+  });
+  L.push('', '== editable elements: ancestor chain ==');
+  document.querySelectorAll('[contenteditable="true"], textarea').forEach((e, i) => {
+    L.push('-- editable #' + i);
+    chain(e).forEach(c => L.push('   ' + c));
+  });
+  L.push('', '== buttons (first 60) ==');
+  Array.from(document.querySelectorAll('button, [role=button]')).slice(0, 60).forEach(b => L.push('   ' + desc(b) + '  text=' + (b.innerText || '').trim().slice(0, 40)));
+  L.push('', '== iframes ==');
+  document.querySelectorAll('iframe').forEach(f => L.push('   ' + (f.src || '').slice(0, 200) + '  ' + desc(f)));
+  L.push('', '== visible text (first 4000 chars) ==');
+  L.push((document.body.innerText || '').slice(0, 4000));
+  return L.join('\\n');
+}
+"""
+
+
+def page_map(page: Page) -> str:
+    parts = []
+    for i, frame in enumerate(page.frames):
+        try:
+            parts.append(f"##### FRAME {i}: {frame.url}\n" + frame.evaluate(PAGE_MAP_JS))
+        except PlaywrightError as exc:
+            parts.append(f"##### FRAME {i}: {frame.url}\n(could not read: {str(exc).splitlines()[0]})")
+    return "\n\n".join(parts)
+
+
 def dump_debug(cfg: Config, teams_page: Page, site_page: Page, log: logging.Logger) -> None:
     out = Path(cfg.data_dir) / "debug" / datetime.now().strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True, exist_ok=True)
     for name, page in (("teams", teams_page), ("site", site_page)):
         try:
+            (out / f"{name}-map.txt").write_text(page_map(page), encoding="utf-8")
             (out / f"{name}.html").write_text(page.content(), encoding="utf-8")
-            page.screenshot(path=str(out / f"{name}.png"), full_page=True)
+            page.screenshot(path=str(out / f"{name}.png"), full_page=False)
         except PlaywrightError as exc:
             log.error("Could not dump %s: %s", name, exc)
     log.info("Debug files written to %s", out)
+    log.info("Send teams-map.txt and site-map.txt (and the .png files) back for selector fixes.")
+    if sys.platform.startswith("win"):
+        try:
+            os.startfile(str(out))  # open the folder in Explorer
+        except OSError:
+            pass
 
 
 def run(cfg: Config, mode: str, log: logging.Logger) -> int:
@@ -523,7 +598,17 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
         site.open()
 
         if mode == "dump":
-            time.sleep(8)
+            print()
+            print("  DUMP MODE")
+            print("  1. In the first tab, get the Teams chat on screen (if it is a meeting,")
+            print("     join it and open the Chat panel so messages are visible).")
+            print("  2. In the second tab, sign in and open the course page.")
+            print("  3. Come back here and press Enter.")
+            print()
+            try:
+                input("  Press Enter when both tabs are ready... ")
+            except EOFError:
+                time.sleep(20)
             dump_debug(cfg, teams_page, site_page, log)
             return 0
 
@@ -598,7 +683,9 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
 
                 if time.time() - last_keepalive > cfg.keepalive_minutes * 60:
                     site.reload()
-                    if site.looks_logged_out():
+                    if site.looks_ready():
+                        site.adopt_current_url()
+                    elif site.looks_logged_out():
                         alert_user(log, "Course site logged you out. Sign in again in the second tab.")
                     last_keepalive = time.time()
             except PlaywrightError as exc:

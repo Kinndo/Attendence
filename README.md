@@ -15,12 +15,17 @@ No Azure app registration, no API keys, no passwords stored.
    for example `C:\AttendanceBot`.
 3. Double-click `setup.bat`. It installs Playwright and creates `config.json`.
 4. Open `config.json` in Notepad and set the two URLs:
-   - `course_url`: open <https://lab.hrblock.com/lmt/>, sign in, open your course so you see
-     **Upcoming Sessions**, then copy the address bar into this field. The `in_sessionid`
-     part changes each sign-in. That is fine, the bot only uses this URL for the first load and
-     keeps the tab alive after that.
-   - `teams_chat_url`: open <https://teams.microsoft.com/> in a browser (not the desktop app),
-     open the class chat, then copy the address bar into this field.
+   - `course_url`: sign in to the LMT site the way you normally do, open your course so you
+     see **Upcoming Sessions** and the Join buttons, then copy the whole address bar into this
+     field. It looks like `https://lab.hrblock.com/lmt/clmsCourseDetails.prMain?in_sessionid=...`.
+     The `in_sessionid` part expires. That is fine: when it does, the bot beeps and you sign in
+     and open the course page in its second tab by hand. The bot then uses whatever page that tab
+     is on. Do not use the bare `https://lab.hrblock.com/lmt/` address, it returns a 404.
+   - `teams_chat_url`: the address of the place where the teacher posts "poll 1". If that is a
+     normal Teams chat, open <https://teams.microsoft.com/> in a browser, open the chat, and copy
+     the address bar. If it is the chat panel inside the class meeting, use the meeting join link
+     and the bot's first tab will open the meeting lobby. Join the meeting there (camera and mic
+     off) and open the Chat panel.
 5. Recommended: set `trigger_sender` to part of the teacher's display name, for example
    `"Crowley"`. Then a classmate typing "is poll 1 up yet?" does not trigger it.
 
@@ -42,11 +47,12 @@ The bot beeps and prints `ACTION NEEDED` if either site logs you out.
 | `test-teams.bat` | Prints the last 8 messages the bot can read and marks which ones would trigger. |
 | `test-site.bat` | Reports whether the acknowledge button is on the course page right now. |
 | `dry-run.bat` | Runs the full watcher but logs what it *would* click and post instead of doing it. |
-| `dump.bat` | Saves HTML and screenshots of both tabs to the debug folder, for troubleshooting. |
+| `dump.bat` | Waits for you to get both tabs ready, then saves a page map, HTML and screenshot of each to the debug folder. |
 
 Run `test-teams.bat` once after setup. If it reads zero messages or the wrong text, run `dump.bat`
-and send back the files from `%LOCALAPPDATA%\AttendanceBot\debug`, since the Teams page layout
-decides which selectors work.
+and send back `teams-map.txt` and `site-map.txt` from `%LOCALAPPDATA%\AttendanceBot\debug`,
+since the Teams page layout decides which selectors work. The map files are small text files
+that describe the page structure without your message content beyond what is on screen.
 
 ## Start automatically when you sign in to Windows
 
