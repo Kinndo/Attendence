@@ -143,9 +143,10 @@ def setup_logging(data_dir: Path) -> logging.Logger:
     log_dir = data_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("bot")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     fmt = logging.Formatter("%(asctime)s  %(levelname)-7s %(message)s")
     stream = logging.StreamHandler(sys.stdout)
+    stream.setLevel(logging.INFO)
     stream.setFormatter(fmt)
     logger.addHandler(stream)
     rotating = logging.handlers.RotatingFileHandler(
@@ -601,10 +602,15 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
                         alert_user(log, "Course site logged you out. Sign in again in the second tab.")
                     last_keepalive = time.time()
             except PlaywrightError as exc:
-                log.error("Browser error in main loop: %s", str(exc).splitlines()[0])
-                if "closed" in str(exc).lower():
-                    log.error("Browser was closed. Exiting.")
+                first = str(exc).splitlines()[0] if str(exc) else repr(exc)
+                log.error("Browser error in main loop: %s", first)
+                log.debug("Traceback:", exc_info=True)
+                if teams_page.is_closed() or site_page.is_closed():
+                    log.error("A browser tab was closed. Exiting.")
                     return 1
+            except Exception:
+                # Anything unexpected: record it in full and keep watching.
+                log.exception("Unexpected error in main loop; continuing.")
             time.sleep(cfg.check_interval_seconds)
 
 
@@ -629,6 +635,9 @@ def main() -> int:
     except KeyboardInterrupt:
         log.info("Stopped by user.")
         return 0
+    except Exception:
+        log.exception("Bot crashed. Full details are in %s", Path(cfg.data_dir) / "logs" / "bot.log")
+        return 2
 
 
 if __name__ == "__main__":
