@@ -5,6 +5,10 @@
   "trigger_pattern": "\\bpoll\\s*\\d+\\b",
   "trigger_sender": "",
   "done_message": "done",
+  "display_name": "Mark Chege",
+  "auto_join": true,
+  "hello_message": "Hello",
+  "join_wait_minutes": 30,
   "cooldown_minutes": 10,
   "check_interval_seconds": 5,
 

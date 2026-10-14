@@ -1,6 +1,7 @@
 # Teams attendance poll bot
 
-Watches your class chat in Microsoft Teams for the teacher's **"poll 1"** / **"poll 2"** message.
+Joins your Teams class meeting under your name, says **Hello** in the meeting chat, then watches
+the chat for the teacher's **"poll 1"** / **"poll 2"** message.
 
 
 It runs on Windows inside one Microsoft Edge window that it controls. You sign in to Teams and
@@ -28,6 +29,19 @@ No Azure app registration, no API keys, no passwords stored.
      off) and open the Chat panel.
 5. Recommended: set `trigger_sender` to part of the teacher's display name, for example
    `"Crowley"`. Then a classmate typing "is poll 1 up yet?" does not trigger it.
+
+## What happens when you start it
+
+1. The first tab opens your Teams link. If it is a meeting link, the bot types `display_name`
+   into the name box, switches the camera and microphone off, clicks **Join**, and waits to be
+   admitted (up to `join_wait_minutes`). If it is a normal chat, it just opens it.
+2. It opens the **Chat** panel if it is not already open.
+3. It posts `hello_message` once per day. Restarting the bot during the same class does not
+   post it again.
+4. It then watches for the trigger message as described below.
+
+Set `auto_join` to `false` if you would rather join by hand, and `hello_message` to `""` to skip
+the greeting.
 
 ## First run
 
@@ -98,6 +112,10 @@ Delete `profile\` to force fresh sign-ins.
 | `trigger_pattern` | `\bpoll\s*\d+\b` | Regular expression a message must match. |
 | `trigger_sender` | `""` | Only trigger on authors whose name contains this. Empty means anyone. |
 | `done_message` | `done` | Text posted to Teams after acknowledging. |
+| `display_name` | `""` | Name typed on the meeting's join screen. |
+| `auto_join` | `true` | Fill in the name and click Join automatically. |
+| `hello_message` | `Hello` | Posted once per day after joining. Empty string disables it. |
+| `join_wait_minutes` | `30` | How long to wait in the lobby before giving up. |
 | `cooldown_minutes` | `10` | Ignore further triggers for this long after one fires. |
 | `check_interval_seconds` | `5` | How often the chat is checked. |
 | `ack_button_pattern` | `acknowledge.*attendance.*poll` | Regular expression for the button text. |

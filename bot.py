@@ -97,6 +97,10 @@ class Config:
     trigger_pattern: str = r"\bpoll\s*\d+\b"
     trigger_sender: str = ""
     done_message: str = "done"
+    display_name: str = ""
+    auto_join: bool = True
+    hello_message: str = "Hello"
+    join_wait_minutes: float = 30
     check_interval_seconds: float = 5
     cooldown_minutes: float = 10
     ack_button_pattern: str = r"acknowledge.*attendance.*poll"
@@ -238,13 +242,13 @@ class Teams:
         self.trigger_re = re.compile(cfg.trigger_pattern, re.IGNORECASE)
 
     def open(self) -> None:
-        self.log.info("Opening Teams chat: %s", self.cfg.teams_chat_url)
+        self.log.info("Opening Teams: %s", self.cfg.teams_chat_url)
         self.page.goto(self.cfg.teams_chat_url, wait_until="domcontentloaded")
         self._dismiss_open_in_app()
 
     def _dismiss_open_in_app(self) -> None:
         """The 'open in the Teams app?' page. Pick the web app if offered."""
-        for label in ("Use the web app instead", "Continue on this browser"):
+        for label in ("Use the web app instead", "Continue on this browser", "Join on the web instead"):
             try:
                 loc = self.page.get_by_text(label, exact=False).first
                 if loc.count() and loc.is_visible():
@@ -253,6 +257,118 @@ class Teams:
                     return
             except PlaywrightError:
                 pass
+
+    # ---- meeting join -------------------------------------------------
+    def _visible(self, locator):
+        try:
+            if locator.count() and locator.first.is_visible():
+                return locator.first
+        except PlaywrightError:
+            pass
+        return None
+
+    def _find_in_frames(self, make_locator):
+        for frame in self.page.frames:
+            try:
+                loc = self._visible(make_locator(frame))
+            except PlaywrightError:
+                loc = None
+            if loc is not None:
+                return loc
+        return None
+
+    def find_name_box(self):
+        name_re = re.compile(r"name", re.I)
+        return self._find_in_frames(
+            lambda f: f.locator('input[placeholder*="name" i], input[aria-label*="name" i]')
+        ) or self._find_in_frames(lambda f: f.get_by_role("textbox", name=name_re))
+
+    def find_join_button(self):
+        join_re = re.compile(r"^\s*join( now| meeting)?\s*$", re.I)
+        return self._find_in_frames(lambda f: f.get_by_role("button", name=join_re))
+
+    def find_chat_button(self):
+        chat_re = re.compile(r"\b(chat|conversation)\b", re.I)
+        return self._find_in_frames(lambda f: f.get_by_role("button", name=chat_re))
+
+    def _switch_off_devices(self) -> None:
+        """Turn the camera and mic toggles off on the pre-join screen, if present."""
+        dev_re = re.compile(r"(camera|video|mic|microphone|audio)", re.I)
+        for frame in self.page.frames:
+            try:
+                switches = frame.get_by_role("switch", name=dev_re)
+                for i in range(switches.count()):
+                    sw = switches.nth(i)
+                    if sw.is_visible() and (sw.get_attribute("aria-checked") or "").lower() == "true":
+                        sw.click()
+                        self.log.info("Turned off: %s", sw.get_attribute("aria-label") or "a device toggle")
+            except PlaywrightError:
+                continue
+
+    def ensure_chat_open(self) -> bool:
+        """Make sure the chat panel (with its message box) is showing."""
+        if self.find_compose_box() is not None:
+            return True
+        btn = self.find_chat_button()
+        if btn is None:
+            return False
+        try:
+            btn.click()
+            self.log.info("Opened the Chat panel.")
+            time.sleep(2)
+        except PlaywrightError:
+            return False
+        return self.find_compose_box() is not None
+
+    def join_meeting(self) -> bool:
+        """Fill in the display name and click Join. Returns True once in the meeting."""
+        if not self.cfg.auto_join:
+            return False
+        # Pre-join screen: name box and Join button. Give it up to 2 minutes to appear.
+        deadline = time.time() + 120
+        name_box = None
+        while time.time() < deadline:
+            self._dismiss_open_in_app()
+            if self.find_compose_box() is not None:
+                self.log.info("Already in the meeting with the chat open.")
+                return True
+            name_box = self.find_name_box()
+            if name_box is not None or self.find_join_button() is not None:
+                break
+            time.sleep(2)
+        if name_box is not None and self.cfg.display_name:
+            try:
+                name_box.click()
+                name_box.fill(self.cfg.display_name)
+                self.log.info("Entered display name %r.", self.cfg.display_name)
+            except PlaywrightError as exc:
+                self.log.warning("Could not type the display name: %s", str(exc).splitlines()[0])
+        self._switch_off_devices()
+        btn = self.find_join_button()
+        if btn is None:
+            self.log.warning("No Join button found. Join the meeting by hand in the first tab.")
+            return False
+        if self.cfg.dry_run:
+            self.log.info("[dry-run] Would click Join now.")
+        try:
+            btn.click()
+            self.log.info("Clicked Join. Waiting to be admitted...")
+        except PlaywrightError as exc:
+            self.log.warning("Clicking Join failed: %s", str(exc).splitlines()[0])
+            return False
+        # Lobby: wait until the in-meeting toolbar (Chat button) or chat box shows up.
+        deadline = time.time() + self.cfg.join_wait_minutes * 60
+        last_note = 0.0
+        while time.time() < deadline:
+            if self.ensure_chat_open():
+                self.log.info("In the meeting; chat panel is open.")
+                return True
+            if time.time() - last_note > 60:
+                self.log.info("Still waiting to get into the meeting (lobby?)...")
+                last_note = time.time()
+            time.sleep(3)
+        self.log.warning("Gave up waiting to be admitted after %s minutes.", self.cfg.join_wait_minutes)
+        return False
 
     def read_messages(self) -> list[dict]:
         """Collect messages from the page and every iframe inside it."""
@@ -271,14 +387,15 @@ class Teams:
         last_nag = 0.0
         while True:
             self._dismiss_open_in_app()
-            if self.read_messages():
+            self.ensure_chat_open()
+            if self.read_messages() or self.find_compose_box() is not None:
                 self.log.info("Teams chat is loaded.")
                 return
             if time.time() - last_nag > 30:
                 alert_user(
                     self.log,
-                    "Teams chat is not showing messages yet. "
-                    "If the first tab asks you to sign in, do that now.",
+                    "Teams chat is not showing yet. In the first tab, sign in or join the "
+                    "meeting and open the Chat panel; the bot carries on once it sees it.",
                 )
                 last_nag = time.time()
             time.sleep(3)
@@ -305,6 +422,7 @@ class Teams:
         if self.cfg.dry_run:
             self.log.info("[dry-run] Would post %r to Teams.", text)
             return True
+        self.ensure_chat_open()
         box = self.find_compose_box()
         if box is None:
             self.log.error("Could not find the Teams message box. Run --dump and send me the files.")
@@ -596,6 +714,8 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
 
         teams.open()
         site.open()
+        if mode in ("run", "test-teams"):
+            teams.join_meeting()
 
         if mode == "dump":
             print()
@@ -632,6 +752,20 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
             return 0
 
         site.wait_until_ready()
+
+        # Say hello once per day, so restarts during the same class stay quiet.
+        hello_marker = Path(cfg.data_dir) / "state" / "hello.json"
+        today = datetime.now().strftime("%Y-%m-%d")
+        already = False
+        if hello_marker.exists():
+            try:
+                already = json.loads(hello_marker.read_text(encoding="utf-8")).get("date") == today
+            except Exception:
+                already = False
+        if cfg.hello_message and not already:
+            if teams.post(cfg.hello_message):
+                hello_marker.parent.mkdir(parents=True, exist_ok=True)
+                hello_marker.write_text(json.dumps({"date": today}), encoding="utf-8")
 
         # Baseline: everything visible now is old news, unless its timestamp
         # says it arrived in the last two minutes (covers a quick restart).
