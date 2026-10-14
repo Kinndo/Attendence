@@ -1,8 +1,7 @@
 # Teams attendance poll bot
 
 Watches your class chat in Microsoft Teams for the teacher's **"poll 1"** / **"poll 2"** message.
-When one arrives it reloads the H&R Block LMT course page, clicks
-**Acknowledge Attendance Poll** next to the Join button, then posts **done** in the Teams chat.
+
 
 It runs on Windows inside one Microsoft Edge window that it controls. You sign in to Teams and
 the LMT site in that window once; the sign-ins are saved in the bot's own browser profile.
