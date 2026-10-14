@@ -1,0 +1,18 @@
+{
+  "teams_chat_url": "https://teams.microsoft.com/v2/",
+  "course_url": "https://lab.hrblock.com/lmt/",
+
+  "trigger_pattern": "\\bpoll\\s*\\d+\\b",
+  "trigger_sender": "",
+  "done_message": "done",
+  "cooldown_minutes": 10,
+  "check_interval_seconds": 5,
+
+  "ack_button_pattern": "acknowledge.*attendance.*poll",
+  "ack_retry_seconds": 600,
+  "ack_retry_interval_seconds": 15,
+  "require_ack_for_done": true,
+  "keepalive_minutes": 5,
+
+  "browser_channel": "msedge"
+}
