@@ -4,9 +4,10 @@ Joins your Teams class meeting under your name, says **Hello** in the meeting ch
 the chat for the teacher's **"poll 1"** / **"poll 2"** message.
 
 
-It runs on Windows inside one Microsoft Edge window that it controls. You sign in to Teams and
-the LMT site in that window once; the sign-ins are saved in the bot's own browser profile.
-No Azure app registration, no API keys, no passwords stored.
+It runs on Windows inside Microsoft Edge windows that it controls. Teams runs in a throwaway
+private session, the same as an InPrivate window: no account, no cookies, so you join every
+class as a guest under the name you set. The LMT site runs in a second window whose sign-in is
+saved between runs. No Azure app registration, no API keys, no passwords stored.
 
 ## One-time setup
 
@@ -32,9 +33,11 @@ No Azure app registration, no API keys, no passwords stored.
 
 ## What happens when you start it
 
-1. The first tab opens your Teams link. If it is a meeting link, the bot types `display_name`
-   into the name box, switches the camera and microphone off, clicks **Join**, and waits to be
-   admitted (up to `join_wait_minutes`). If it is a normal chat, it just opens it.
+1. The Teams window opens your meeting link in a private session. When Edge or Teams asks
+   whether to open the Teams app, the bot picks **Continue on this browser**, and if Teams
+   offers it, **Join as a guest**. It then types `display_name` into the name box, switches
+   the camera and microphone off, clicks **Join**, and waits to be admitted (up to
+   `join_wait_minutes`).
 2. It opens the **Chat** panel if it is not already open.
 3. It posts `hello_message` once per day. Restarting the bot during the same class does not
    post it again.
@@ -45,13 +48,13 @@ the greeting.
 
 ## First run
 
-1. Double-click `run.bat`. An Edge window opens with two tabs.
-2. Sign in to Teams in the first tab and to the LMT site in the second tab. If the LMT tab
-   lands somewhere other than your course page, go to the course page in that same tab.
+1. Double-click `run.bat`. Two Edge windows open: one for Teams, one for the LMT site.
+2. Sign in to the LMT site in its window. If it lands somewhere other than your course page,
+   go to the course page in that same tab. The Teams window joins on its own.
 3. The console says `Baselined N existing messages. Watching for ...` once both tabs are ready.
    Leave the window open. You can minimise it.
 
-Sign-ins persist, so the next time `run.bat` is usually enough on its own.
+The LMT sign-in is saved, so the next time `run.bat` is usually enough on its own.
 The bot beeps and prints `ACTION NEEDED` if either site logs you out.
 
 ## Testing without posting anything
@@ -96,12 +99,13 @@ command plus `-Remove`.
 
 Everything the bot writes lives in `%LOCALAPPDATA%\AttendanceBot`:
 
-- `profile\` the saved browser sign-ins
 - `logs\bot.log` what it did and when
+- `state\site-storage.json` the saved LMT sign-in cookies
 - `state\seen.json` messages already handled
+- `state\hello.json` the day the greeting was last posted
 - `debug\` output of `dump.bat`
 
-Delete `profile\` to force fresh sign-ins.
+Delete `state\site-storage.json` to force a fresh LMT sign-in. Teams never keeps a sign-in.
 
 ## Config reference
 
@@ -134,7 +138,8 @@ Delete `profile\` to force fresh sign-ins.
 - The bot works by reading the Teams web page. If Microsoft changes the page layout the bot may
   stop seeing messages until the selectors are updated. `test-teams.bat` shows you quickly
   whether that has happened.
-- Teams on the web must stay open in the bot's window. Closing the window stops the bot.
+- Teams on the web must stay open in the bot's window. Closing either window stops the bot.
+- Because Teams runs as a guest, the teacher may need to admit you from the lobby each class.
 - The computer must be awake and unlocked at class time. Check your power settings.
 - Marking yourself present when you are not in class may breach your school's attendance
   policy. Use this to save the chore, not to skip class.

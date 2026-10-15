@@ -235,28 +235,72 @@ def stable_key(msg: dict) -> str:
 # Teams side
 # --------------------------------------------------------------------------
 class Teams:
+    LAUNCHER_LABELS = (
+        "Continue on this browser",
+        "Use the web app instead",
+        "Join on the web instead",
+        "Join from this browser",
+    )
+    GUEST_LABELS = ("Join as a guest", "Join as guest", "Continue without an account")
+
     def __init__(self, page: Page, cfg: Config, log: logging.Logger):
         self.page = page
         self.cfg = cfg
         self.log = log
         self.trigger_re = re.compile(cfg.trigger_pattern, re.IGNORECASE)
+        self._last_launcher_click = 0.0
+        # Teams sometimes opens the web app in a new tab. Follow it.
+        page.context.on("page", self._on_new_page)
+
+    def _on_new_page(self, new_page: Page) -> None:
+        try:
+            new_page.wait_for_load_state("domcontentloaded", timeout=15_000)
+        except PlaywrightError:
+            pass
+        self.log.info("Teams opened a new tab (%s); following it.", new_page.url[:80])
+        old = self.page
+        self.page = new_page
+        try:
+            if not old.is_closed() and "teams" not in (old.url or ""):
+                old.close()
+        except PlaywrightError:
+            pass
 
     def open(self) -> None:
         self.log.info("Opening Teams: %s", self.cfg.teams_chat_url)
         self.page.goto(self.cfg.teams_chat_url, wait_until="domcontentloaded")
         self._dismiss_open_in_app()
 
+    def _click_label(self, labels, what: str) -> bool:
+        """Click the first visible button/link whose text matches one of labels."""
+        for label in labels:
+            pat = re.compile(re.escape(label), re.I)
+            for frame in self.page.frames:
+                for finder in (
+                    lambda f: f.get_by_role("button", name=pat),
+                    lambda f: f.get_by_role("link", name=pat),
+                    lambda f: f.get_by_text(pat),
+                ):
+                    try:
+                        loc = finder(frame).first
+                        if loc.count() and loc.is_visible():
+                            loc.click()
+                            self.log.info("Clicked '%s' (%s).", label, what)
+                            return True
+                    except PlaywrightError:
+                        continue
+        return False
+
     def _dismiss_open_in_app(self) -> None:
-        """The 'open in the Teams app?' page. Pick the web app if offered."""
-        for label in ("Use the web app instead", "Continue on this browser", "Join on the web instead"):
-            try:
-                loc = self.page.get_by_text(label, exact=False).first
-                if loc.count() and loc.is_visible():
-                    loc.click()
-                    self.log.info("Chose '%s' on the Teams launcher page.", label)
-                    return
-            except PlaywrightError:
-                pass
+        """The 'Open Microsoft Teams?' launcher page: stay in the browser.
+        Clicked at most once every 20 seconds so it cannot loop."""
+        if time.time() - self._last_launcher_click < 20:
+            return
+        if self._click_label(self.LAUNCHER_LABELS, "stay in the browser"):
+            self._last_launcher_click = time.time()
+            time.sleep(3)
+        if self._click_label(self.GUEST_LABELS, "join as guest"):
+            time.sleep(2)
 
     # ---- meeting join -------------------------------------------------
     def _visible(self, locator):
@@ -600,18 +644,18 @@ class CourseSite:
 # --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
-def launch_browser(p, cfg: Config, log: logging.Logger) -> BrowserContext:
-    profile_dir = Path(cfg.data_dir) / "profile"
-    profile_dir.mkdir(parents=True, exist_ok=True)
+def launch_browser(p, cfg: Config, log: logging.Logger):
+    """Start Edge (or a fallback browser). Contexts are created by the caller."""
     # ATTENDANCE_BOT_HEADLESS=1 is only for automated testing; the real bot
     # needs a visible window so you can sign in.
     headless = os.environ.get("ATTENDANCE_BOT_HEADLESS") == "1"
-    common = dict(user_data_dir=str(profile_dir), headless=headless, no_viewport=True)
+    # The sandbox is what keeps Edge from showing its "unsupported flag" bar.
+    common = dict(headless=headless, chromium_sandbox=sys.platform.startswith("win"))
     if cfg.browser_executable:
-        return p.chromium.launch_persistent_context(executable_path=cfg.browser_executable, **common)
+        return p.chromium.launch(executable_path=cfg.browser_executable, **common)
     if cfg.browser_channel:
         try:
-            return p.chromium.launch_persistent_context(channel=cfg.browser_channel, **common)
+            return p.chromium.launch(channel=cfg.browser_channel, **common)
         except PlaywrightError as exc:
             log.warning(
                 "Could not start browser channel %r (%s). Falling back to Playwright's Chromium. "
@@ -619,7 +663,35 @@ def launch_browser(p, cfg: Config, log: logging.Logger) -> BrowserContext:
                 cfg.browser_channel,
                 str(exc).splitlines()[0],
             )
-    return p.chromium.launch_persistent_context(**common)
+    return p.chromium.launch(**common)
+
+
+def open_contexts(browser, cfg: Config, log: logging.Logger):
+    """
+    Teams gets a throwaway context: no cookies, no account, gone when the bot
+    exits. That is the same as an InPrivate window, so Teams treats you as a
+    guest every time. The course site gets a context whose cookies are saved
+    to disk so its sign-in can survive between runs.
+    """
+    teams_ctx = browser.new_context(no_viewport=True)
+    site_state = Path(cfg.data_dir) / "state" / "site-storage.json"
+    site_kwargs = dict(no_viewport=True)
+    if site_state.exists():
+        site_kwargs["storage_state"] = str(site_state)
+    try:
+        site_ctx = browser.new_context(**site_kwargs)
+    except PlaywrightError as exc:
+        log.warning("Saved site cookies could not be loaded (%s); starting clean.", str(exc).splitlines()[0])
+        site_ctx = browser.new_context(no_viewport=True)
+    return teams_ctx, site_ctx, site_state
+
+
+def save_site_state(site_ctx, site_state: Path, log: logging.Logger) -> None:
+    try:
+        site_state.parent.mkdir(parents=True, exist_ok=True)
+        site_ctx.storage_state(path=str(site_state))
+    except PlaywrightError as exc:
+        log.debug("Could not save site cookies: %s", exc)
 
 
 # Compact description of a page: which data-tid values exist, what the
@@ -706,9 +778,10 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
     old_cutoff = started_at - timedelta(minutes=2)
 
     with sync_playwright() as p:
-        ctx = launch_browser(p, cfg, log)
-        teams_page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        site_page = ctx.new_page()
+        browser = launch_browser(p, cfg, log)
+        teams_ctx, site_ctx, site_state = open_contexts(browser, cfg, log)
+        teams_page = teams_ctx.new_page()
+        site_page = site_ctx.new_page()
         teams = Teams(teams_page, cfg, log)
         site = CourseSite(site_page, cfg, log)
 
@@ -729,7 +802,7 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
                 input("  Press Enter when both tabs are ready... ")
             except EOFError:
                 time.sleep(20)
-            dump_debug(cfg, teams_page, site_page, log)
+            dump_debug(cfg, teams.page, site_page, log)
             return 0
 
         if mode == "test-site":
@@ -752,6 +825,7 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
             return 0
 
         site.wait_until_ready()
+        save_site_state(site_ctx, site_state, log)
 
         # Say hello once per day, so restarts during the same class stay quiet.
         hello_marker = Path(cfg.data_dir) / "state" / "hello.json"
@@ -819,6 +893,7 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
                     site.reload()
                     if site.looks_ready():
                         site.adopt_current_url()
+                        save_site_state(site_ctx, site_state, log)
                     elif site.looks_logged_out():
                         alert_user(log, "Course site logged you out. Sign in again in the second tab.")
                     last_keepalive = time.time()
@@ -826,7 +901,7 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
                 first = str(exc).splitlines()[0] if str(exc) else repr(exc)
                 log.error("Browser error in main loop: %s", first)
                 log.debug("Traceback:", exc_info=True)
-                if teams_page.is_closed() or site_page.is_closed():
+                if teams.page.is_closed() or site_page.is_closed():
                     log.error("A browser tab was closed. Exiting.")
                     return 1
             except Exception:
