@@ -33,9 +33,10 @@ saved between runs. No Azure app registration, no API keys, no passwords stored.
 
 ## What happens when you start it
 
-1. The Teams window opens your meeting link in a private session. When Edge or Teams asks
-   whether to open the Teams app, the bot picks **Continue on this browser**, and if Teams
-   offers it, **Join as a guest**. It then types `display_name` into the name box, switches
+1. The Teams window opens your meeting link in a private session. The bot rewrites the link
+   to the address the web app uses, so Edge's "This site is trying to open Microsoft Teams"
+   popup never appears. If a launcher page shows anyway, it picks **Continue on this browser**,
+   and if Teams offers it, **Join as a guest**. It then types `display_name` into the name box, switches
    the camera and microphone off, clicks **Join**, and waits to be admitted (up to
    `join_wait_minutes`).
 2. It opens the **Chat** panel if it is not already open.

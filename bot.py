@@ -33,6 +33,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from playwright.sync_api import (
     BrowserContext,
@@ -231,6 +232,43 @@ def stable_key(msg: dict) -> str:
     return "h:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+def direct_teams_url(url: str) -> str:
+    """
+    Turn a Teams meeting link into the address the web app itself uses, so the
+    browser never shows the launcher page. The launcher is what triggers
+    Edge's "This site is trying to open Microsoft Teams" popup, which no
+    script can click away.
+
+      https://teams.live.com/meet/123?p=abc
+        -> https://teams.live.com/_#/meet/123?p=abc&anon=true
+      https://teams.live.com/dl/launcher/launcher.html?url=%2F_%23%2Fmeet...
+        -> https://teams.live.com/_#/meet...   (the launcher's own target)
+      https://teams.microsoft.com/l/meetup-join/...
+        -> https://teams.microsoft.com/_#/l/meetup-join/...&anon=true
+    Anything else is returned unchanged.
+    """
+    try:
+        u = urlparse(url)
+    except ValueError:
+        return url
+    host = (u.netloc or "").lower()
+    if "teams" not in host:
+        return url
+    origin = f"{u.scheme}://{u.netloc}"
+    if "launcher" in u.path.lower():
+        target = parse_qs(u.query).get("url", [""])[0]
+        if target.startswith("/"):
+            return origin + target
+        return url
+    path = u.path or ""
+    if path.startswith("/meet/") or path.startswith("/l/"):
+        q = parse_qs(u.query, keep_blank_values=True)
+        q.setdefault("anon", ["true"])
+        flat = {k: v[0] for k, v in q.items()}
+        return f"{origin}/_#{path}?{urlencode(flat)}"
+    return url
+
+
 # --------------------------------------------------------------------------
 # Teams side
 # --------------------------------------------------------------------------
@@ -267,8 +305,11 @@ class Teams:
             pass
 
     def open(self) -> None:
-        self.log.info("Opening Teams: %s", self.cfg.teams_chat_url)
-        self.page.goto(self.cfg.teams_chat_url, wait_until="domcontentloaded")
+        url = direct_teams_url(self.cfg.teams_chat_url)
+        if url != self.cfg.teams_chat_url:
+            self.log.info("Skipping the Teams launcher page; opening the web app directly.")
+        self.log.info("Opening Teams: %s", url)
+        self.page.goto(url, wait_until="domcontentloaded")
         self._dismiss_open_in_app()
 
     def _click_label(self, labels, what: str) -> bool:
@@ -296,6 +337,17 @@ class Teams:
         Clicked at most once every 20 seconds so it cannot loop."""
         if time.time() - self._last_launcher_click < 20:
             return
+        current = self.page.url or ""
+        if "launcher" in current.lower():
+            target = direct_teams_url(current)
+            if target != current:
+                self._last_launcher_click = time.time()
+                self.log.info("On the launcher page; going straight to the web app instead.")
+                try:
+                    self.page.goto(target, wait_until="domcontentloaded")
+                except PlaywrightError as exc:
+                    self.log.warning("Could not leave the launcher page: %s", str(exc).splitlines()[0])
+                return
         if self._click_label(self.LAUNCHER_LABELS, "stay in the browser"):
             self._last_launcher_click = time.time()
             time.sleep(3)
