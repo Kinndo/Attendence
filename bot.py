@@ -295,7 +295,13 @@ class Teams:
             new_page.wait_for_load_state("domcontentloaded", timeout=15_000)
         except PlaywrightError:
             pass
-        self.log.info("Teams opened a new tab (%s); following it.", new_page.url[:80])
+        url = new_page.url or ""
+        # Browser-internal pages (edge://permission-request-dialog/ and the
+        # like) show up here too. Only follow a real Teams web page.
+        if not url.startswith(("http://", "https://", "file://")) or "teams" not in url.lower() and not url.startswith("file://"):
+            self.log.debug("Ignoring new non-Teams page: %s", url[:80])
+            return
+        self.log.info("Teams opened a new tab (%s); following it.", url[:80])
         old = self.page
         self.page = new_page
         try:
@@ -726,6 +732,13 @@ def open_contexts(browser, cfg: Config, log: logging.Logger):
     to disk so its sign-in can survive between runs.
     """
     teams_ctx = browser.new_context(no_viewport=True)
+    # Teams insists on camera and mic permission before it shows the join
+    # screen. Grant it up front so Edge never shows the Allow/Block prompt;
+    # the bot still switches both devices off on the join screen.
+    try:
+        teams_ctx.grant_permissions(["camera", "microphone"])
+    except PlaywrightError as exc:
+        log.warning("Could not pre-grant camera/mic permission: %s", str(exc).splitlines()[0])
     site_state = Path(cfg.data_dir) / "state" / "site-storage.json"
     site_kwargs = dict(no_viewport=True)
     if site_state.exists():
