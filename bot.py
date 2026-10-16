@@ -129,6 +129,14 @@ class Config:
         cfg = cls(**known)
         if not cfg.teams_chat_url or not cfg.course_url:
             sys.exit("config.json needs both teams_chat_url and course_url.")
+        if re.sub(r"/+$", "", cfg.course_url).lower().endswith("/lmt"):
+            sys.exit(
+                "course_url in config.json is still the placeholder (it ends in /lmt/, which the "
+                "site answers with a 404).\n"
+                "Sign in to the LMT site, open your course so you see 'Upcoming Sessions', and "
+                "paste the whole address bar into course_url. It starts with\n"
+                "  https://lab.hrblock.com/lmt/clmsCourseDetails.prMain?in_sessionid=..."
+            )
         cfg.teams_message_selectors = (
             cfg.teams_message_selectors or DEFAULT_MESSAGE_SELECTORS
         )
@@ -280,6 +288,11 @@ class Teams:
         "Join from this browser",
     )
     GUEST_LABELS = ("Join as a guest", "Join as guest", "Continue without an account")
+    PREJOIN_DISMISS_LABELS = (
+        "Continue without audio or video",
+        "Continue without audio",
+        "Continue without video",
+    )
 
     def __init__(self, page: Page, cfg: Config, log: logging.Logger):
         self.page = page
@@ -381,9 +394,20 @@ class Teams:
 
     def find_name_box(self):
         name_re = re.compile(r"name", re.I)
-        return self._find_in_frames(
-            lambda f: f.locator('input[placeholder*="name" i], input[aria-label*="name" i]')
-        ) or self._find_in_frames(lambda f: f.get_by_role("textbox", name=name_re))
+        return (
+            self._find_in_frames(
+                lambda f: f.locator(
+                    'input[placeholder*="name" i], input[aria-label*="name" i], '
+                    'input[data-tid*="name" i], input[id*="name" i]'
+                )
+            )
+            or self._find_in_frames(lambda f: f.get_by_role("textbox", name=name_re))
+            or self._find_in_frames(lambda f: f.locator('input[type="text"]:not([readonly])'))
+        )
+
+    def _dismiss_prejoin_dialogs(self) -> bool:
+        """Teams' 'Are you sure you don't want audio or video?' box and friends."""
+        return self._click_label(self.PREJOIN_DISMISS_LABELS, "continue without devices")
 
     def find_join_button(self):
         join_re = re.compile(r"^\s*join( now| meeting)?\s*$", re.I)
@@ -392,6 +416,21 @@ class Teams:
     def find_chat_button(self):
         chat_re = re.compile(r"\b(chat|conversation)\b", re.I)
         return self._find_in_frames(lambda f: f.get_by_role("button", name=chat_re))
+
+    def _enter_name(self, name_box) -> None:
+        name = self.cfg.display_name
+        try:
+            try:
+                name_box.click(timeout=5_000)
+            except PlaywrightError:
+                pass
+            name_box.fill(name)
+            if (name_box.input_value() or "").strip() != name:
+                name_box.fill("")
+                name_box.press_sequentially(name, delay=40)
+            self.log.info("Entered display name %r.", name)
+        except PlaywrightError as exc:
+            self.log.warning("Could not type the display name: %s", str(exc).splitlines()[0])
 
     def _switch_off_devices(self) -> None:
         """Turn the camera and mic toggles off on the pre-join screen, if present."""
@@ -431,6 +470,8 @@ class Teams:
         name_box = None
         while time.time() < deadline:
             self._dismiss_open_in_app()
+            if self._dismiss_prejoin_dialogs():
+                time.sleep(2)
             if self.find_compose_box() is not None:
                 self.log.info("Already in the meeting with the chat open.")
                 return True
@@ -439,24 +480,40 @@ class Teams:
                 break
             time.sleep(2)
         if name_box is not None and self.cfg.display_name:
-            try:
-                name_box.click()
-                name_box.fill(self.cfg.display_name)
-                self.log.info("Entered display name %r.", self.cfg.display_name)
-            except PlaywrightError as exc:
-                self.log.warning("Could not type the display name: %s", str(exc).splitlines()[0])
+            self._enter_name(name_box)
         self._switch_off_devices()
         btn = self.find_join_button()
         if btn is None:
             self.log.warning("No Join button found. Join the meeting by hand in the first tab.")
             return False
+        # Join stays greyed out until Teams accepts the name. Give it a moment.
+        for _ in range(15):
+            try:
+                if btn.is_enabled():
+                    break
+            except PlaywrightError:
+                pass
+            self._dismiss_prejoin_dialogs()
+            nb = self.find_name_box()
+            if nb is not None and self.cfg.display_name:
+                try:
+                    if (nb.input_value() or "").strip() != self.cfg.display_name:
+                        self._enter_name(nb)
+                except PlaywrightError:
+                    pass
+            time.sleep(1)
+            btn = self.find_join_button() or btn
         if self.cfg.dry_run:
             self.log.info("[dry-run] Would click Join now.")
         try:
-            btn.click()
+            btn.click(timeout=15_000)
             self.log.info("Clicked Join. Waiting to be admitted...")
         except PlaywrightError as exc:
-            self.log.warning("Clicking Join failed: %s", str(exc).splitlines()[0])
+            self.log.warning(
+                "Clicking Join failed (%s). If the Join button is greyed out, type the name "
+                "by hand in the first tab and click Join yourself.",
+                str(exc).splitlines()[0],
+            )
             return False
         # Lobby: wait until the in-meeting toolbar (Chat button) or chat box shows up.
         deadline = time.time() + self.cfg.join_wait_minutes * 60
