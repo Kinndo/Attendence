@@ -2,14 +2,14 @@
   "teams_chat_url": "https://teams.microsoft.com/v2/",
   "course_url": "https://lab.hrblock.com/lmt/",
 
-  "trigger_pattern": "\\bpoll\\s*\\d+\\b",
+  "trigger_pattern": "\\bpoll\\b\\s*(\\d+)?",
   "trigger_sender": "",
   "done_message": "done",
   "display_name": "Mark Chege",
-  "auto_join": true,
-  "hello_message": "Hello",
+  "auto_join": false,
+  "hello_message": "",
   "join_wait_minutes": 30,
-  "cooldown_minutes": 10,
+  "cooldown_minutes": 2,
   "check_interval_seconds": 5,
 
   "ack_button_pattern": "acknowledge.*attendance.*poll",

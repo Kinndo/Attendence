@@ -95,15 +95,15 @@ EXTRACT_MESSAGES_JS = """
 class Config:
     teams_chat_url: str
     course_url: str
-    trigger_pattern: str = r"\bpoll\s*\d+\b"
+    trigger_pattern: str = r"\bpoll\b\s*(\d+)?"
     trigger_sender: str = ""
     done_message: str = "done"
     display_name: str = ""
-    auto_join: bool = True
-    hello_message: str = "Hello"
+    auto_join: bool = False
+    hello_message: str = ""
     join_wait_minutes: float = 30
     check_interval_seconds: float = 5
-    cooldown_minutes: float = 10
+    cooldown_minutes: float = 2
     ack_button_pattern: str = r"acknowledge.*attendance.*poll"
     ack_retry_seconds: float = 600
     ack_retry_interval_seconds: float = 15
@@ -559,6 +559,17 @@ class Teams:
                 last_nag = time.time()
             time.sleep(3)
 
+    def poll_number(self, msg: dict):
+        """The number after 'poll', if the teacher wrote one (e.g. 'POLL 3' -> '3')."""
+        m = self.trigger_re.search(msg.get("text", ""))
+        if not m:
+            return None
+        try:
+            num = m.group(1)
+        except IndexError:
+            num = None
+        return num.strip() if num else None
+
     def is_trigger(self, msg: dict) -> bool:
         if not self.trigger_re.search(msg.get("text", "")):
             return False
@@ -978,6 +989,25 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
 
         last_keepalive = time.time()
         last_trigger_time = 0.0
+
+        # Which poll numbers were handled today, so "poll 3" is acted on once
+        # even if the teacher repeats it or the bot restarts mid-class.
+        polls_path = Path(cfg.data_dir) / "state" / "polls.json"
+        handled_polls: set[str] = set()
+        try:
+            data = json.loads(polls_path.read_text(encoding="utf-8"))
+            if data.get("date") == datetime.now().strftime("%Y-%m-%d"):
+                handled_polls = set(data.get("polls", []))
+        except Exception:
+            pass
+
+        def remember_poll(num: str) -> None:
+            handled_polls.add(num)
+            polls_path.parent.mkdir(parents=True, exist_ok=True)
+            polls_path.write_text(
+                json.dumps({"date": datetime.now().strftime("%Y-%m-%d"), "polls": sorted(handled_polls, key=lambda x: int(x) if x.isdigit() else 0)}),
+                encoding="utf-8",
+            )
         last_empty_warning = 0.0
 
         while True:
@@ -998,14 +1028,20 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
                     log.info("New message from %r: %s", m["author"], m["text"][:120].replace("\n", " "))
                     if not teams.is_trigger(m):
                         continue
-                    if time.time() - last_trigger_time < cfg.cooldown_minutes * 60:
+                    num = teams.poll_number(m)
+                    if num is not None and num in handled_polls:
+                        log.info("Poll %s was already handled today; ignoring.", num)
+                        continue
+                    if num is None and time.time() - last_trigger_time < cfg.cooldown_minutes * 60:
                         log.info("Trigger matched but within cooldown; ignoring.")
                         continue
                     last_trigger_time = time.time()
-                    log.info("TRIGGER: %r from %r", m["text"][:80], m["author"])
+                    log.info("TRIGGER: %r from %r (poll %s)", m["text"][:80], m["author"], num or "?")
                     acked = site.acknowledge()
                     if acked or not cfg.require_ack_for_done:
-                        teams.post(cfg.done_message)
+                        if teams.post(cfg.done_message) and num is not None:
+                            remember_poll(num)
+                            log.info("Handled polls today: %s", ", ".join(sorted(handled_polls, key=lambda x: int(x) if x.isdigit() else 0)))
                     else:
                         alert_user(log, "Could not acknowledge the poll. Do it by hand and post 'done'.")
                     seen.save()

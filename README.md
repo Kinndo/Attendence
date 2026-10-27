@@ -1,13 +1,19 @@
 # Teams attendance poll bot
 
-Joins your Teams class meeting under your name, says **Hello** in the meeting chat, then watches
-the chat for the teacher's **"poll 1"** / **"poll 2"** message.
+You join the class meeting and sign in to the LMT site yourself. The bot then does three things,
+for every poll of the session:
 
+1. watches the meeting chat for the teacher's **POLL** message ("POLL", "poll 1", "Poll 12" all count),
+2. reloads the H&R Block LMT course page and clicks **Acknowledge Attendance Poll** next to Join,
+3. posts **done** in the chat.
 
-It runs on Windows inside Microsoft Edge windows that it controls. Teams runs in a throwaway
-private session, the same as an InPrivate window: no account, no cookies, so you join every
-class as a guest under the name you set. The LMT site runs in a second window whose sign-in is
-saved between runs. No Azure app registration, no API keys, no passwords stored.
+It remembers which poll numbers it has handled today, so each poll is acted on once even if the
+message is repeated or the bot restarts mid-class.
+
+It runs on Windows inside two Microsoft Edge windows that it controls: one for Teams, one for the
+LMT site. The Teams window is a private session with no saved account, so you join the meeting
+in it each class. The LMT window keeps its sign-in between runs. No Azure app registration, no
+API keys, no passwords stored.
 
 ## One-time setup
 
@@ -33,30 +39,26 @@ saved between runs. No Azure app registration, no API keys, no passwords stored.
 
 ## What happens when you start it
 
-1. The Teams window opens your meeting link in a private session. The bot rewrites the link
-   to the address the web app uses, so Edge's "This site is trying to open Microsoft Teams"
-   popup never appears. If a launcher page shows anyway, it picks **Continue on this browser**,
-   and if Teams offers it, **Join as a guest**. It then types `display_name` into the name box, switches
-   the camera and microphone off, clicks **Join**, and waits to be admitted (up to
-   `join_wait_minutes`).
-2. It opens the **Chat** panel if it is not already open.
-3. It posts `hello_message` once per day. Restarting the bot during the same class does not
-   post it again.
-4. It then watches for the trigger message as described below.
+1. Two Edge windows open. The Teams one opens your meeting link; the LMT one opens your course page.
+2. You join the meeting in the Teams window (name, camera and mic off, Join) and open the
+   **Chat** panel. You sign in to the LMT site in the other window if it asks.
+3. The console prints `Baselined N existing messages. Watching for ...` once it can see both the
+   chat and the course page. From then on it is watching. Leave both windows open.
 
-Set `auto_join` to `false` if you would rather join by hand, and `hello_message` to `""` to skip
-the greeting.
+Optional extras, off by default in `config.json`: `auto_join` makes the bot type `display_name`
+and click Join itself; `hello_message` posts a greeting once per day after it starts watching.
 
 ## First run
 
-1. Double-click `run.bat`. Two Edge windows open: one for Teams, one for the LMT site.
-2. Sign in to the LMT site in its window. If it lands somewhere other than your course page,
-   go to the course page in that same tab. The Teams window joins on its own.
-3. The console says `Baselined N existing messages. Watching for ...` once both tabs are ready.
-   Leave the window open. You can minimise it.
+1. Double-click `run.bat`.
+2. In the Teams window, join the meeting and open the Chat panel.
+3. In the LMT window, sign in if asked and make sure the course page with the Join buttons is
+   showing. If it shows a login page or an error, navigate to the course page in that same tab;
+   the bot picks up whatever page the tab lands on.
+4. Wait for `Baselined N existing messages` in the console. You can minimise the console.
 
-The LMT sign-in is saved, so the next time `run.bat` is usually enough on its own.
-The bot beeps and prints `ACTION NEEDED` if either site logs you out.
+The bot beeps and prints `ACTION NEEDED` if it loses either page, for example if the LMT site
+signs you out.
 
 ## Testing without posting anything
 
@@ -84,11 +86,15 @@ command plus `-Remove`.
 ## How it decides
 
 - A message counts as a trigger when its text matches `trigger_pattern` (default: the word
-  "poll" followed by a number, any capitalisation) and, if `trigger_sender` is set, its author
-  name contains that text.
+  "poll", any capitalisation, with or without a number) and, if `trigger_sender` is set, its
+  author name contains that text. Set `trigger_sender` to part of the teacher's name so a
+  classmate asking "is the poll up?" does not trigger it.
+- When the message has a number, that number is recorded for the day in `state\polls.json` and
+  the same number is never acted on twice. Messages without a number fall back to
+  `cooldown_minutes`.
 - Messages already on screen when the bot starts are ignored, unless they arrived in the last two
   minutes. Handled messages are remembered in a state file, so a restart never repeats one.
-- After a trigger, further triggers are ignored for `cooldown_minutes` (default 10).
+- After a trigger without a number, further triggers are ignored for `cooldown_minutes` (default 2).
 - The bot reloads the course page every `ack_retry_interval_seconds` for up to
   `ack_retry_seconds` (default 10 minutes) waiting for the acknowledge button, in case the
   teacher posts before the button shows. It clicks the button and any OK/Confirm prompt.
@@ -103,6 +109,7 @@ Everything the bot writes lives in `%LOCALAPPDATA%\AttendanceBot`:
 - `logs\bot.log` what it did and when
 - `state\site-storage.json` the saved LMT sign-in cookies
 - `state\seen.json` messages already handled
+- `state\polls.json` poll numbers handled today
 - `state\hello.json` the day the greeting was last posted
 - `debug\` output of `dump.bat`
 
@@ -114,14 +121,14 @@ Delete `state\site-storage.json` to force a fresh LMT sign-in. Teams never keeps
 | --- | --- | --- |
 | `teams_chat_url` | | Address bar URL of the class chat in Teams on the web. |
 | `course_url` | | Address bar URL of the LMT course page. |
-| `trigger_pattern` | `\bpoll\s*\d+\b` | Regular expression a message must match. |
+| `trigger_pattern` | `\bpoll\b\s*(\d+)?` | Regular expression a message must match; group 1 is the poll number. |
 | `trigger_sender` | `""` | Only trigger on authors whose name contains this. Empty means anyone. |
 | `done_message` | `done` | Text posted to Teams after acknowledging. |
 | `display_name` | `""` | Name typed on the meeting's join screen. |
-| `auto_join` | `true` | Fill in the name and click Join automatically. |
-| `hello_message` | `Hello` | Posted once per day after joining. Empty string disables it. |
+| `auto_join` | `false` | Fill in the name and click Join automatically. |
+| `hello_message` | `""` | Posted once per day after the bot starts watching. Empty disables it. |
 | `join_wait_minutes` | `30` | How long to wait in the lobby before giving up. |
-| `cooldown_minutes` | `10` | Ignore further triggers for this long after one fires. |
+| `cooldown_minutes` | `2` | For messages without a poll number: ignore further triggers for this long. |
 | `check_interval_seconds` | `5` | How often the chat is checked. |
 | `ack_button_pattern` | `acknowledge.*attendance.*poll` | Regular expression for the button text. |
 | `ack_retry_seconds` | `600` | How long to keep reloading for the button. |
