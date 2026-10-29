@@ -5,7 +5,8 @@ for every poll of the session:
 
 1. watches the meeting chat for the teacher's **POLL** message ("POLL", "poll 1", "Poll 12" all count),
 2. reloads the H&R Block LMT course page and clicks **Acknowledge Attendance Poll** next to Join,
-3. posts **done** in the chat.
+3. posts **done** in the chat,
+4. and when the class says goodbye at the end, says **Goodbye** too, leaves the meeting and stops.
 
 It remembers which poll numbers it has handled today, so each poll is acted on once even if the
 message is repeated or the bot restarts mid-class.
@@ -101,6 +102,9 @@ command plus `-Remove`.
 - "done" is posted only after a successful acknowledge. Set `require_ack_for_done` to `false`
   to post regardless.
 - Every `keepalive_minutes` the course tab is reloaded so the LMT session does not time out.
+- When `goodbye_threshold` different people have said goodbye (bye, good night, see you, and so
+  on) within `goodbye_window_minutes`, the bot posts `goodbye_message`, clicks **Leave** in the
+  meeting, and exits. Your own messages do not count if `display_name` is set.
 
 ## Files and folders
 
@@ -128,6 +132,11 @@ Delete `state\site-storage.json` to force a fresh LMT sign-in. Teams never keeps
 | `auto_join` | `false` | Fill in the name and click Join automatically. |
 | `hello_message` | `""` | Posted once per day after the bot starts watching. Empty disables it. |
 | `join_wait_minutes` | `30` | How long to wait in the lobby before giving up. |
+| `goodbye_pattern` | built in | Regular expression for a goodbye message. |
+| `goodbye_threshold` | `3` | How many different people must say goodbye. |
+| `goodbye_window_minutes` | `5` | They must all say it within this many minutes. |
+| `goodbye_message` | `Goodbye` | What the bot posts before leaving. Empty skips the post. |
+| `leave_after_goodbye` | `true` | Click Leave and exit once the goodbyes come in. |
 | `cooldown_minutes` | `2` | For messages without a poll number: ignore further triggers for this long. |
 | `check_interval_seconds` | `5` | How often the chat is checked. |
 | `ack_button_pattern` | `acknowledge.*attendance.*poll` | Regular expression for the button text. |

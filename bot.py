@@ -102,6 +102,11 @@ class Config:
     auto_join: bool = False
     hello_message: str = ""
     join_wait_minutes: float = 30
+    goodbye_pattern: str = r"\b(good\s*bye|bye+|good\s*night|see (you|ya|y'all)|take care|have a good (one|night))\b"
+    goodbye_threshold: int = 3
+    goodbye_window_minutes: float = 5
+    goodbye_message: str = "Goodbye"
+    leave_after_goodbye: bool = True
     check_interval_seconds: float = 5
     cooldown_minutes: float = 2
     ack_button_pattern: str = r"acknowledge.*attendance.*poll"
@@ -412,6 +417,45 @@ class Teams:
     def find_join_button(self):
         join_re = re.compile(r"^\s*join( now| meeting)?\s*$", re.I)
         return self._find_in_frames(lambda f: f.get_by_role("button", name=join_re))
+
+    def is_goodbye(self, msg: dict) -> bool:
+        if not self.cfg.goodbye_pattern:
+            return False
+        if self.cfg.display_name and self.cfg.display_name.lower() in msg.get("author", "").lower():
+            return False  # our own message
+        return re.search(self.cfg.goodbye_pattern, msg.get("text", ""), re.I) is not None
+
+    def find_leave_button(self):
+        leave_re = re.compile(r"^\s*(leave|leave meeting|hang up)\b", re.I)
+        return self._find_in_frames(lambda f: f.get_by_role("button", name=leave_re))
+
+    def leave_meeting(self) -> bool:
+        if self.cfg.dry_run:
+            self.log.info("[dry-run] Would click Leave now.")
+            return True
+        btn = self.find_leave_button()
+        if btn is None:
+            self.log.warning("No Leave button found; leave the meeting by hand.")
+            return False
+        try:
+            btn.click()
+        except PlaywrightError as exc:
+            self.log.warning("Clicking Leave failed: %s", str(exc).splitlines()[0])
+            return False
+        # Some layouts open a small menu (Leave / End meeting). Pick Leave.
+        time.sleep(1.5)
+        confirm_re = re.compile(r"^\s*leave( meeting)?\s*$", re.I)
+        for frame in self.page.frames:
+            for role in ("menuitem", "button"):
+                try:
+                    loc = frame.get_by_role(role, name=confirm_re).first
+                    if loc.count() and loc.is_visible():
+                        loc.click()
+                        break
+                except PlaywrightError:
+                    continue
+        self.log.info("Left the meeting.")
+        return True
 
     def find_chat_button(self):
         chat_re = re.compile(r"\b(chat|conversation)\b", re.I)
@@ -1001,6 +1045,8 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
         except Exception:
             pass
 
+        goodbyes: dict[str, float] = {}  # author -> time of their last goodbye
+
         def remember_poll(num: str) -> None:
             handled_polls.add(num)
             polls_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1026,6 +1072,20 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
                     if ts is not None and ts < old_cutoff:
                         continue
                     log.info("New message from %r: %s", m["author"], m["text"][:120].replace("\n", " "))
+                    if teams.is_goodbye(m):
+                        goodbyes[m["author"] or m["key"]] = time.time()
+                        window = cfg.goodbye_window_minutes * 60
+                        recent = [a for a, t in goodbyes.items() if time.time() - t <= window]
+                        log.info("Goodbye from %r (%d/%d in the last %g min).", m["author"], len(recent), cfg.goodbye_threshold, cfg.goodbye_window_minutes)
+                        if len(recent) >= cfg.goodbye_threshold:
+                            log.info("Class is wrapping up. Saying goodbye and leaving.")
+                            if cfg.goodbye_message:
+                                teams.post(cfg.goodbye_message)
+                            if cfg.leave_after_goodbye:
+                                teams.leave_meeting()
+                            seen.save()
+                            log.info("Done for today. Handled polls: %s", ", ".join(sorted(handled_polls, key=lambda x: int(x) if x.isdigit() else 0)) or "none")
+                            return 0
                     if not teams.is_trigger(m):
                         continue
                     num = teams.poll_number(m)

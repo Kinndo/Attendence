@@ -9,6 +9,11 @@
   "auto_join": false,
   "hello_message": "",
   "join_wait_minutes": 30,
+
+  "goodbye_threshold": 3,
+  "goodbye_window_minutes": 5,
+  "goodbye_message": "Goodbye",
+  "leave_after_goodbye": true,
   "cooldown_minutes": 2,
   "check_interval_seconds": 5,
 
