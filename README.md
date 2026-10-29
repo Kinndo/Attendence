@@ -133,7 +133,7 @@ Delete `state\site-storage.json` to force a fresh LMT sign-in. Teams never keeps
 | `hello_message` | `""` | Posted once per day after the bot starts watching. Empty disables it. |
 | `join_wait_minutes` | `30` | How long to wait in the lobby before giving up. |
 | `goodbye_pattern` | built in | Regular expression for a goodbye message. |
-| `goodbye_threshold` | `3` | How many different people must say goodbye. |
+| `goodbye_threshold` | `5` | How many different people must say goodbye. |
 | `goodbye_window_minutes` | `5` | They must all say it within this many minutes. |
 | `goodbye_message` | `Goodbye` | What the bot posts before leaving. Empty skips the post. |
 | `leave_after_goodbye` | `true` | Click Leave and exit once the goodbyes come in. |

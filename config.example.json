@@ -10,7 +10,7 @@
   "hello_message": "",
   "join_wait_minutes": 30,
 
-  "goodbye_threshold": 3,
+  "goodbye_threshold": 5,
   "goodbye_window_minutes": 5,
   "goodbye_message": "Goodbye",
   "leave_after_goodbye": true,

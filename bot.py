@@ -103,7 +103,7 @@ class Config:
     hello_message: str = ""
     join_wait_minutes: float = 30
     goodbye_pattern: str = r"\b(good\s*bye|bye+|good\s*night|see (you|ya|y'all)|take care|have a good (one|night))\b"
-    goodbye_threshold: int = 3
+    goodbye_threshold: int = 5
     goodbye_window_minutes: float = 5
     goodbye_message: str = "Goodbye"
     leave_after_goodbye: bool = True
