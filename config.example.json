@@ -6,7 +6,9 @@
   "trigger_sender": "",
   "done_message": "done",
   "display_name": "Mark Chege",
-  "auto_join": false,
+  "auto_join": true,
+  "join_at": "21:00",
+  "class_days": ["Mon", "Wed", "Fri"],
   "hello_message": "",
   "join_wait_minutes": 30,
 

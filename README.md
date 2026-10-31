@@ -46,8 +46,22 @@ API keys, no passwords stored.
 3. The console prints `Baselined N existing messages. Watching for ...` once it can see both the
    chat and the course page. From then on it is watching. Leave both windows open.
 
-Optional extras, off by default in `config.json`: `auto_join` makes the bot type `display_name`
-and click Join itself; `hello_message` posts a greeting once per day after it starts watching.
+## Joining on a schedule
+
+Set `join_at` (24-hour clock, for example `"21:00"`) and `class_days` (for example
+`["Mon", "Wed", "Fri"]`) in `config.json` and the bot runs the whole class on its own:
+
+1. Start `run.bat` any time before class, or let the Startup shortcut start it at sign-in. The
+   LMT window opens straight away so you can sign in early if it asks.
+2. At `join_at` on a class day the Teams window opens the meeting, types `display_name`,
+   switches camera and mic off, clicks **Join**, waits for admission, and opens the Chat panel.
+   Starting the bot late still joins, as long as it is within `session_hours` of `join_at`.
+3. It watches for polls as usual.
+4. When `goodbye_threshold` people say goodbye, it says goodbye, leaves, closes the Teams
+   window, and waits for the next class day. It never rejoins a class it has already left.
+
+Leave `join_at` empty to go back to joining by hand. `auto_join` on its own joins immediately
+at startup; `hello_message` posts a greeting once per day after the bot starts watching.
 
 ## First run
 
@@ -129,7 +143,10 @@ Delete `state\site-storage.json` to force a fresh LMT sign-in. Teams never keeps
 | `trigger_sender` | `""` | Only trigger on authors whose name contains this. Empty means anyone. |
 | `done_message` | `done` | Text posted to Teams after acknowledging. |
 | `display_name` | `""` | Name typed on the meeting's join screen. |
-| `auto_join` | `false` | Fill in the name and click Join automatically. |
+| `auto_join` | `true` | Fill in the name and click Join automatically. Always on when `join_at` is set. |
+| `join_at` | `21:00` | Time of day to join, 24-hour clock. Empty disables scheduling. |
+| `class_days` | `["Mon","Wed","Fri"]` | Days the bot joins on. Empty means every day. |
+| `session_hours` | `3` | A start this long after `join_at` still joins the same class. |
 | `hello_message` | `""` | Posted once per day after the bot starts watching. Empty disables it. |
 | `join_wait_minutes` | `30` | How long to wait in the lobby before giving up. |
 | `goodbye_pattern` | built in | Regular expression for a goodbye message. |

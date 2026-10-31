@@ -102,6 +102,9 @@ class Config:
     auto_join: bool = False
     hello_message: str = ""
     join_wait_minutes: float = 30
+    join_at: str = ""            # e.g. "21:00": wait until then, join, and repeat on class days
+    class_days: list = None      # e.g. ["Mon", "Wed", "Fri"]; empty means every day
+    session_hours: float = 3     # how long after join_at a late start still joins
     goodbye_pattern: str = r"\b(good\s*bye|bye+|good\s*night|see (you|ya|y'all)|take care|have a good (one|night))\b"
     goodbye_threshold: int = 5
     goodbye_window_minutes: float = 5
@@ -148,6 +151,13 @@ class Config:
         cfg.teams_compose_selectors = (
             cfg.teams_compose_selectors or DEFAULT_COMPOSE_SELECTORS
         )
+        cfg.class_days = cfg.class_days or []
+        if cfg.join_at:
+            try:
+                parse_hhmm(cfg.join_at)
+            except ValueError:
+                sys.exit(f"join_at must look like 21:00 (24-hour clock); got {cfg.join_at!r}")
+            cfg.auto_join = True  # a scheduled join is an automatic join
         if not cfg.data_dir:
             base = os.environ.get("LOCALAPPDATA") or str(Path.home())
             cfg.data_dir = str(Path(base) / "AttendanceBot")
@@ -236,6 +246,45 @@ def parse_ts(value: str):
         return dt
     except ValueError:
         return None
+
+
+DAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def parse_hhmm(value: str):
+    hh, mm = value.strip().split(":")
+    hh, mm = int(hh), int(mm)
+    if not (0 <= hh < 24 and 0 <= mm < 60):
+        raise ValueError(value)
+    return hh, mm
+
+
+def is_class_day(day: datetime, class_days: list) -> bool:
+    if not class_days:
+        return True
+    wanted = {d.strip().lower()[:3] for d in class_days}
+    return DAY_NAMES[day.weekday()] in wanted
+
+
+def next_join_time(cfg: Config, now: datetime, skip_date: str = "") -> datetime:
+    """
+    When to join next. If today is a class day and we are within
+    session_hours after join_at, that is now. Otherwise the next class day
+    at join_at. A day equal to skip_date (YYYY-MM-DD) is passed over, used
+    after a class we already attended and left.
+    """
+    hh, mm = parse_hhmm(cfg.join_at)
+    for offset in range(0, 15):
+        day = (now + timedelta(days=offset)).replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if not is_class_day(day, cfg.class_days):
+            continue
+        if skip_date and day.strftime("%Y-%m-%d") == skip_date:
+            continue
+        if day <= now <= day + timedelta(hours=cfg.session_hours):
+            return now
+        if day > now:
+            return day
+    return now + timedelta(days=1)
 
 
 def stable_key(msg: dict) -> str:
@@ -949,183 +998,256 @@ def dump_debug(cfg: Config, teams_page: Page, site_page: Page, log: logging.Logg
             pass
 
 
+def say_hello_once(cfg: Config, teams: "Teams", log: logging.Logger) -> None:
+    """Post hello_message once per day, so restarts during the same class stay quiet."""
+    if not cfg.hello_message:
+        return
+    hello_marker = Path(cfg.data_dir) / "state" / "hello.json"
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        if json.loads(hello_marker.read_text(encoding="utf-8")).get("date") == today:
+            return
+    except Exception:
+        pass
+    if teams.post(cfg.hello_message):
+        hello_marker.parent.mkdir(parents=True, exist_ok=True)
+        hello_marker.write_text(json.dumps({"date": today}), encoding="utf-8")
+
+
+def wait_for_join_time(cfg: Config, site: "CourseSite", site_ctx, site_state: Path,
+                       log: logging.Logger, skip_date: str = "") -> None:
+    """Sleep until join_at on the next class day, keeping the course tab alive."""
+    target = next_join_time(cfg, datetime.now(), skip_date)
+    if target <= datetime.now():
+        return
+    log.info("Waiting until %s to join the meeting. Sign in to the course site meanwhile if it asks.",
+             target.strftime("%a %Y-%m-%d %H:%M"))
+    last_keepalive = time.time()
+    last_note = time.time()
+    while datetime.now() < target:
+        time.sleep(min(30, max(1, (target - datetime.now()).total_seconds())))
+        if time.time() - last_keepalive > cfg.keepalive_minutes * 60:
+            try:
+                site.reload()
+                if site.looks_ready():
+                    site.adopt_current_url()
+                    save_site_state(site_ctx, site_state, log)
+            except PlaywrightError as exc:
+                log.debug("keepalive reload failed: %s", exc)
+            last_keepalive = time.time()
+        if time.time() - last_note > 1800:
+            log.info("Still waiting; joining at %s.", target.strftime("%a %H:%M"))
+            last_note = time.time()
+    log.info("It is %s. Joining now.", target.strftime("%H:%M"))
+
+
+def watch(cfg: Config, teams: "Teams", site: "CourseSite", site_ctx, site_state: Path,
+          seen: SeenStore, log: logging.Logger) -> str:
+    """
+    The main loop for one class. Returns "goodbye" when the class wrapped up
+    and the bot left, or "closed" when a browser window was closed.
+    """
+    old_cutoff = datetime.now(timezone.utc) - timedelta(minutes=2)
+    site_page = site.page
+
+    # Baseline: everything visible now is old news, unless its timestamp
+    # says it arrived in the last two minutes (covers a quick restart).
+    baseline = 0
+    for m in teams.read_messages():
+        ts = parse_ts(m["ts"])
+        if ts is None or ts < old_cutoff:
+            seen.add(m["key"])
+            baseline += 1
+    seen.save()
+    log.info("Baselined %d existing messages. Watching for /%s/ ...", baseline, cfg.trigger_pattern)
+    if cfg.dry_run:
+        log.info("DRY RUN: nothing will be clicked or posted.")
+
+    last_keepalive = time.time()
+    last_trigger_time = 0.0
+    last_empty_warning = 0.0
+
+    # Which poll numbers were handled today, so "poll 3" is acted on once
+    # even if the teacher repeats it or the bot restarts mid-class.
+    polls_path = Path(cfg.data_dir) / "state" / "polls.json"
+    handled_polls: set[str] = set()
+    try:
+        data = json.loads(polls_path.read_text(encoding="utf-8"))
+        if data.get("date") == datetime.now().strftime("%Y-%m-%d"):
+            handled_polls = set(data.get("polls", []))
+    except Exception:
+        pass
+
+    def polls_sorted() -> str:
+        return ", ".join(sorted(handled_polls, key=lambda x: int(x) if x.isdigit() else 0)) or "none"
+
+    def remember_poll(num: str) -> None:
+        handled_polls.add(num)
+        polls_path.parent.mkdir(parents=True, exist_ok=True)
+        polls_path.write_text(
+            json.dumps({"date": datetime.now().strftime("%Y-%m-%d"),
+                        "polls": sorted(handled_polls, key=lambda x: int(x) if x.isdigit() else 0)}),
+            encoding="utf-8",
+        )
+
+    goodbyes: dict[str, float] = {}  # author -> time of their last goodbye
+
+    while True:
+        try:
+            msgs = teams.read_messages()
+            if not msgs:
+                if time.time() - last_empty_warning > 60:
+                    log.warning("Teams chat shows no messages; page may have reloaded or logged out.")
+                    last_empty_warning = time.time()
+                teams._dismiss_open_in_app()
+            for m in msgs:
+                if m["key"] in seen:
+                    continue
+                seen.add(m["key"])
+                ts = parse_ts(m["ts"])
+                if ts is not None and ts < old_cutoff:
+                    continue
+                log.info("New message from %r: %s", m["author"], m["text"][:120].replace("\n", " "))
+                if teams.is_goodbye(m):
+                    goodbyes[m["author"] or m["key"]] = time.time()
+                    window = cfg.goodbye_window_minutes * 60
+                    recent = [a for a, t in goodbyes.items() if time.time() - t <= window]
+                    log.info("Goodbye from %r (%d/%d in the last %g min).", m["author"], len(recent),
+                             cfg.goodbye_threshold, cfg.goodbye_window_minutes)
+                    if len(recent) >= cfg.goodbye_threshold:
+                        log.info("Class is wrapping up. Saying goodbye and leaving.")
+                        if cfg.goodbye_message:
+                            teams.post(cfg.goodbye_message)
+                        if cfg.leave_after_goodbye:
+                            teams.leave_meeting()
+                        seen.save()
+                        log.info("Done for today. Handled polls: %s", polls_sorted())
+                        return "goodbye"
+                if not teams.is_trigger(m):
+                    continue
+                num = teams.poll_number(m)
+                if num is not None and num in handled_polls:
+                    log.info("Poll %s was already handled today; ignoring.", num)
+                    continue
+                if num is None and time.time() - last_trigger_time < cfg.cooldown_minutes * 60:
+                    log.info("Trigger matched but within cooldown; ignoring.")
+                    continue
+                last_trigger_time = time.time()
+                log.info("TRIGGER: %r from %r (poll %s)", m["text"][:80], m["author"], num or "?")
+                acked = site.acknowledge()
+                if acked or not cfg.require_ack_for_done:
+                    if teams.post(cfg.done_message) and num is not None:
+                        remember_poll(num)
+                        log.info("Handled polls today: %s", polls_sorted())
+                else:
+                    alert_user(log, "Could not acknowledge the poll. Do it by hand and post 'done'.")
+                seen.save()
+            seen.save()
+
+            if time.time() - last_keepalive > cfg.keepalive_minutes * 60:
+                site.reload()
+                if site.looks_ready():
+                    site.adopt_current_url()
+                    save_site_state(site_ctx, site_state, log)
+                elif site.looks_logged_out():
+                    alert_user(log, "Course site logged you out. Sign in again in the second tab.")
+                last_keepalive = time.time()
+        except PlaywrightError as exc:
+            first = str(exc).splitlines()[0] if str(exc) else repr(exc)
+            log.error("Browser error in main loop: %s", first)
+            log.debug("Traceback:", exc_info=True)
+            if teams.page.is_closed() or site_page.is_closed():
+                log.error("A browser tab was closed. Exiting.")
+                return "closed"
+        except Exception:
+            # Anything unexpected: record it in full and keep watching.
+            log.exception("Unexpected error in main loop; continuing.")
+        time.sleep(cfg.check_interval_seconds)
+
+
 def run(cfg: Config, mode: str, log: logging.Logger) -> int:
     seen = SeenStore(Path(cfg.data_dir) / "state" / "seen.json")
-    started_at = datetime.now(timezone.utc)
-    old_cutoff = started_at - timedelta(minutes=2)
 
     with sync_playwright() as p:
         browser = launch_browser(p, cfg, log)
         teams_ctx, site_ctx, site_state = open_contexts(browser, cfg, log)
-        teams_page = teams_ctx.new_page()
         site_page = site_ctx.new_page()
-        teams = Teams(teams_page, cfg, log)
         site = CourseSite(site_page, cfg, log)
-
-        teams.open()
         site.open()
-        if mode in ("run", "test-teams"):
-            teams.join_meeting()
 
-        if mode == "dump":
-            print()
-            print("  DUMP MODE")
-            print("  1. In the first tab, get the Teams chat on screen (if it is a meeting,")
-            print("     join it and open the Chat panel so messages are visible).")
-            print("  2. In the second tab, sign in and open the course page.")
-            print("  3. Come back here and press Enter.")
-            print()
-            try:
-                input("  Press Enter when both tabs are ready... ")
-            except EOFError:
-                time.sleep(20)
-            dump_debug(cfg, teams.page, site_page, log)
-            return 0
+        scheduled = mode == "run" and bool(cfg.join_at)
+        if scheduled:
+            log.info("Scheduled mode: joining at %s on %s.", cfg.join_at,
+                     ", ".join(cfg.class_days) if cfg.class_days else "every day")
 
-        if mode == "test-site":
-            site.wait_until_ready()
-            btn = site.find_ack_button()
-            if btn is None:
-                log.info("No acknowledge button on the course page right now (expected outside a poll).")
-            else:
-                log.info("Found acknowledge button with text: %r", btn.inner_text().strip())
-            return 0
-
-        teams.wait_until_ready()
-
-        if mode == "test-teams":
-            msgs = teams.read_messages()
-            log.info("Read %d messages. Last 8:", len(msgs))
-            for m in msgs[-8:]:
-                flag = "TRIGGER" if teams.is_trigger(m) else "       "
-                log.info("  %s | %-20s | %-25s | %s", flag, m["author"][:20], m["ts"], m["text"][:80].replace("\n", " "))
-            return 0
-
-        site.wait_until_ready()
-        save_site_state(site_ctx, site_state, log)
-
-        # Say hello once per day, so restarts during the same class stay quiet.
-        hello_marker = Path(cfg.data_dir) / "state" / "hello.json"
-        today = datetime.now().strftime("%Y-%m-%d")
-        already = False
-        if hello_marker.exists():
-            try:
-                already = json.loads(hello_marker.read_text(encoding="utf-8")).get("date") == today
-            except Exception:
-                already = False
-        if cfg.hello_message and not already:
-            if teams.post(cfg.hello_message):
-                hello_marker.parent.mkdir(parents=True, exist_ok=True)
-                hello_marker.write_text(json.dumps({"date": today}), encoding="utf-8")
-
-        # Baseline: everything visible now is old news, unless its timestamp
-        # says it arrived in the last two minutes (covers a quick restart).
-        baseline = 0
-        for m in teams.read_messages():
-            ts = parse_ts(m["ts"])
-            if ts is None or ts < old_cutoff:
-                seen.add(m["key"])
-                baseline += 1
-        seen.save()
-        log.info("Baselined %d existing messages. Watching for /%s/ ...", baseline, cfg.trigger_pattern)
-        if cfg.dry_run:
-            log.info("DRY RUN: nothing will be clicked or posted.")
-
-        last_keepalive = time.time()
-        last_trigger_time = 0.0
-
-        # Which poll numbers were handled today, so "poll 3" is acted on once
-        # even if the teacher repeats it or the bot restarts mid-class.
-        polls_path = Path(cfg.data_dir) / "state" / "polls.json"
-        handled_polls: set[str] = set()
-        try:
-            data = json.loads(polls_path.read_text(encoding="utf-8"))
-            if data.get("date") == datetime.now().strftime("%Y-%m-%d"):
-                handled_polls = set(data.get("polls", []))
-        except Exception:
-            pass
-
-        goodbyes: dict[str, float] = {}  # author -> time of their last goodbye
-
-        def remember_poll(num: str) -> None:
-            handled_polls.add(num)
-            polls_path.parent.mkdir(parents=True, exist_ok=True)
-            polls_path.write_text(
-                json.dumps({"date": datetime.now().strftime("%Y-%m-%d"), "polls": sorted(handled_polls, key=lambda x: int(x) if x.isdigit() else 0)}),
-                encoding="utf-8",
-            )
-        last_empty_warning = 0.0
-
+        attended_date = ""  # the class day we already joined and left
         while True:
-            try:
-                msgs = teams.read_messages()
-                if not msgs:
-                    if time.time() - last_empty_warning > 60:
-                        log.warning("Teams chat shows no messages; page may have reloaded or logged out.")
-                        last_empty_warning = time.time()
-                    teams._dismiss_open_in_app()
-                for m in msgs:
-                    if m["key"] in seen:
-                        continue
-                    seen.add(m["key"])
-                    ts = parse_ts(m["ts"])
-                    if ts is not None and ts < old_cutoff:
-                        continue
-                    log.info("New message from %r: %s", m["author"], m["text"][:120].replace("\n", " "))
-                    if teams.is_goodbye(m):
-                        goodbyes[m["author"] or m["key"]] = time.time()
-                        window = cfg.goodbye_window_minutes * 60
-                        recent = [a for a, t in goodbyes.items() if time.time() - t <= window]
-                        log.info("Goodbye from %r (%d/%d in the last %g min).", m["author"], len(recent), cfg.goodbye_threshold, cfg.goodbye_window_minutes)
-                        if len(recent) >= cfg.goodbye_threshold:
-                            log.info("Class is wrapping up. Saying goodbye and leaving.")
-                            if cfg.goodbye_message:
-                                teams.post(cfg.goodbye_message)
-                            if cfg.leave_after_goodbye:
-                                teams.leave_meeting()
-                            seen.save()
-                            log.info("Done for today. Handled polls: %s", ", ".join(sorted(handled_polls, key=lambda x: int(x) if x.isdigit() else 0)) or "none")
-                            return 0
-                    if not teams.is_trigger(m):
-                        continue
-                    num = teams.poll_number(m)
-                    if num is not None and num in handled_polls:
-                        log.info("Poll %s was already handled today; ignoring.", num)
-                        continue
-                    if num is None and time.time() - last_trigger_time < cfg.cooldown_minutes * 60:
-                        log.info("Trigger matched but within cooldown; ignoring.")
-                        continue
-                    last_trigger_time = time.time()
-                    log.info("TRIGGER: %r from %r (poll %s)", m["text"][:80], m["author"], num or "?")
-                    acked = site.acknowledge()
-                    if acked or not cfg.require_ack_for_done:
-                        if teams.post(cfg.done_message) and num is not None:
-                            remember_poll(num)
-                            log.info("Handled polls today: %s", ", ".join(sorted(handled_polls, key=lambda x: int(x) if x.isdigit() else 0)))
-                    else:
-                        alert_user(log, "Could not acknowledge the poll. Do it by hand and post 'done'.")
-                    seen.save()
-                seen.save()
+            if scheduled:
+                wait_for_join_time(cfg, site, site_ctx, site_state, log, attended_date)
 
-                if time.time() - last_keepalive > cfg.keepalive_minutes * 60:
-                    site.reload()
-                    if site.looks_ready():
-                        site.adopt_current_url()
-                        save_site_state(site_ctx, site_state, log)
-                    elif site.looks_logged_out():
-                        alert_user(log, "Course site logged you out. Sign in again in the second tab.")
-                    last_keepalive = time.time()
-            except PlaywrightError as exc:
-                first = str(exc).splitlines()[0] if str(exc) else repr(exc)
-                log.error("Browser error in main loop: %s", first)
-                log.debug("Traceback:", exc_info=True)
-                if teams.page.is_closed() or site_page.is_closed():
-                    log.error("A browser tab was closed. Exiting.")
-                    return 1
-            except Exception:
-                # Anything unexpected: record it in full and keep watching.
-                log.exception("Unexpected error in main loop; continuing.")
-            time.sleep(cfg.check_interval_seconds)
+            teams_page = teams_ctx.new_page()
+            teams = Teams(teams_page, cfg, log)
+            teams.open()
+            if mode in ("run", "test-teams"):
+                teams.join_meeting()
+
+            if mode == "dump":
+                print()
+                print("  DUMP MODE")
+                print("  1. In the first tab, get the Teams chat on screen (if it is a meeting,")
+                print("     join it and open the Chat panel so messages are visible).")
+                print("  2. In the second tab, sign in and open the course page.")
+                print("  3. Come back here and press Enter.")
+                print()
+                try:
+                    input("  Press Enter when both tabs are ready... ")
+                except EOFError:
+                    time.sleep(20)
+                dump_debug(cfg, teams.page, site_page, log)
+                return 0
+
+            if mode == "test-site":
+                site.wait_until_ready()
+                btn = site.find_ack_button()
+                if btn is None:
+                    log.info("No acknowledge button on the course page right now (expected outside a poll).")
+                else:
+                    log.info("Found acknowledge button with text: %r", btn.inner_text().strip())
+                return 0
+
+            teams.wait_until_ready()
+
+            if mode == "test-teams":
+                msgs = teams.read_messages()
+                log.info("Read %d messages. Last 8:", len(msgs))
+                for m in msgs[-8:]:
+                    flag = "TRIGGER" if teams.is_trigger(m) else "       "
+                    log.info("  %s | %-20s | %-25s | %s", flag, m["author"][:20], m["ts"],
+                             m["text"][:80].replace("\n", " "))
+                return 0
+
+            site.wait_until_ready()
+            save_site_state(site_ctx, site_state, log)
+            say_hello_once(cfg, teams, log)
+
+            result = watch(cfg, teams, site, site_ctx, site_state, seen, log)
+            if result == "closed":
+                return 1
+            if not scheduled:
+                return 0
+
+            # Scheduled mode: drop this Teams session and wait for the next class.
+            attended_date = datetime.now().strftime("%Y-%m-%d")
+            log.info("Closing the Teams window until the next class.")
+            try:
+                teams_ctx.close()
+            except PlaywrightError:
+                pass
+            teams_ctx = browser.new_context(no_viewport=True)
+            try:
+                teams_ctx.grant_permissions(["camera", "microphone"])
+            except PlaywrightError:
+                pass
 
 
 def main() -> int:
