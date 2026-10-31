@@ -93,8 +93,8 @@ EXTRACT_MESSAGES_JS = """
 
 @dataclass
 class Config:
-    teams_chat_url: str
     course_url: str
+    teams_chat_url: str = ""
     trigger_pattern: str = r"\bpoll\b\s*(\d+)?"
     trigger_sender: str = ""
     done_message: str = "done"
@@ -102,6 +102,8 @@ class Config:
     auto_join: bool = False
     hello_message: str = ""
     join_wait_minutes: float = 30
+    meeting_link_from_site: bool = True   # click Join on the course page to get the meeting link
+    meeting_link_pattern: str = r"teams\."  # what the popped-up link must contain
     join_at: str = ""            # e.g. "21:00": wait until then, join, and repeat on class days
     class_days: list = None      # e.g. ["Mon", "Wed", "Fri"]; empty means every day
     session_hours: float = 3     # how long after join_at a late start still joins
@@ -135,8 +137,10 @@ class Config:
             raw = json.load(fh)
         known = {k: v for k, v in raw.items() if k in cls.__dataclass_fields__}
         cfg = cls(**known)
-        if not cfg.teams_chat_url or not cfg.course_url:
-            sys.exit("config.json needs both teams_chat_url and course_url.")
+        if not cfg.course_url:
+            sys.exit("config.json needs course_url.")
+        if not cfg.teams_chat_url and not cfg.meeting_link_from_site:
+            sys.exit("config.json needs teams_chat_url, or meeting_link_from_site set to true.")
         if re.sub(r"/+$", "", cfg.course_url).lower().endswith("/lmt"):
             sys.exit(
                 "course_url in config.json is still the placeholder (it ends in /lmt/, which the "
@@ -377,9 +381,10 @@ class Teams:
         except PlaywrightError:
             pass
 
-    def open(self) -> None:
-        url = direct_teams_url(self.cfg.teams_chat_url)
-        if url != self.cfg.teams_chat_url:
+    def open(self, url: str = "") -> None:
+        source = url or self.cfg.teams_chat_url
+        url = direct_teams_url(source)
+        if url != source:
             self.log.info("Skipping the Teams launcher page; opening the web app directly.")
         self.log.info("Opening Teams: %s", url)
         self.page.goto(url, wait_until="domcontentloaded")
@@ -777,6 +782,134 @@ class CourseSite:
                 )
                 last_nag = time.time()
             time.sleep(3)
+
+    def find_join_link(self):
+        """
+        The Join button for today's session on the course page. Prefers the
+        row that mentions today's date (e.g. "Wed, 10/14"); otherwise the
+        first visible, enabled Join.
+        """
+        now = datetime.now()
+        today = f"{now.month}/{now.day}"
+        join_re = re.compile(r"^\s*join\s*$", re.I)
+        for frame in self.page.frames:
+            for role in ("link", "button"):
+                try:
+                    cands = frame.get_by_role(role, name=join_re)
+                    n = cands.count()
+                except PlaywrightError:
+                    continue
+                fallback = None
+                for i in range(n):
+                    c = cands.nth(i)
+                    try:
+                        if not c.is_visible() or not c.is_enabled():
+                            continue
+                        # Text of the smallest block around this Join that holds a
+                        # date and no other Join button: that is its session row.
+                        row_text = c.evaluate(
+                            """el => {
+                              const isJoin = n => /^\\s*join\\s*$/i.test(n.innerText || '');
+                              let e = el.parentElement;
+                              for (let i = 0; i < 10 && e && e !== document.body; i++) {
+                                const joins = Array.from(e.querySelectorAll('a,button')).filter(isJoin).length;
+                                if (joins > 1) break;
+                                const t = e.innerText || '';
+                                if (/\\d{1,2}\\/\\d{1,2}/.test(t)) return t;
+                                e = e.parentElement;
+                              }
+                              return '';
+                            }"""
+                        ) or ""
+                    except PlaywrightError:
+                        continue
+                    if re.search(r"\b" + re.escape(today) + r"\b", row_text):
+                        return c
+                    fallback = fallback or c
+                if fallback is not None:
+                    return fallback
+        return None
+
+    def meeting_link(self, wait_minutes: float) -> str:
+        """
+        Click Join on the course page and return the Teams link it opens.
+        Retries (reloading) until the Join button is enabled, for up to
+        wait_minutes. Returns "" if it never gets a link.
+        """
+        link_re = re.compile(self.cfg.meeting_link_pattern, re.I)
+        deadline = time.time() + wait_minutes * 60
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            if attempt > 1:
+                self.reload()
+                time.sleep(2)
+            if self.looks_logged_out():
+                alert_user(self.log, "Course site is asking you to sign in. Sign in now in the course window.")
+                time.sleep(30)
+                continue
+            btn = self.find_join_link()
+            if btn is None:
+                self.log.info("Attempt %d: no enabled Join button on the course page yet; retrying in 30s.", attempt)
+                time.sleep(30)
+                continue
+            if self.cfg.dry_run:
+                self.log.info("[dry-run] Would click Join on the course page.")
+            popup = None
+            before = self.page.url
+            try:
+                with self.page.expect_popup(timeout=10_000) as info:
+                    btn.click()
+                popup = info.value
+            except PlaywrightTimeout:
+                popup = None
+            except PlaywrightError as exc:
+                self.log.warning("Clicking Join on the course page failed: %s", str(exc).splitlines()[0])
+                time.sleep(10)
+                continue
+            self.log.info("Clicked Join on the course page.")
+            url = ""
+            if popup is not None:
+                url = self._link_from_page(popup, link_re)
+                try:
+                    popup.close()
+                except PlaywrightError:
+                    pass
+            else:
+                # No popup: maybe it navigated this tab instead.
+                url = self._link_from_page(self.page, link_re)
+                if self.page.url != before:
+                    try:
+                        self.page.go_back(wait_until="domcontentloaded")
+                    except PlaywrightError:
+                        self.page.goto(self.course_url, wait_until="domcontentloaded")
+            if url:
+                self.log.info("Meeting link from the course page: %s", url[:120])
+                return url
+            self.log.warning("Join opened something, but no Teams link was found in it. Retrying.")
+            time.sleep(15)
+        self.log.error("Gave up looking for the Join button after %s minutes.", wait_minutes)
+        return ""
+
+    def _link_from_page(self, page: Page, link_re) -> str:
+        """Wait for a page to land on (or show) a link matching link_re."""
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            try:
+                url = page.url or ""
+                if link_re.search(url) and not url.startswith("about:"):
+                    return url
+                for frame in page.frames:
+                    hrefs = frame.evaluate(
+                        "() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href)"
+                    ) or []
+                    for h in hrefs:
+                        if link_re.search(h):
+                            return h
+            except PlaywrightError:
+                pass
+            time.sleep(1)
+        return ""
 
     def find_ack_button(self):
         """Search every frame for a button/link whose name matches the pattern."""
@@ -1185,9 +1318,21 @@ def run(cfg: Config, mode: str, log: logging.Logger) -> int:
             if scheduled:
                 wait_for_join_time(cfg, site, site_ctx, site_state, log, attended_date)
 
+            meeting_url = ""
+            if cfg.meeting_link_from_site and mode in ("run", "test-teams"):
+                site.wait_until_ready()
+                save_site_state(site_ctx, site_state, log)
+                meeting_url = site.meeting_link(cfg.join_wait_minutes)
+                if not meeting_url and not cfg.teams_chat_url:
+                    alert_user(log, "Could not get the meeting link from the course page. "
+                                    "Join by hand in the Teams window when it opens.")
+                    meeting_url = "https://teams.live.com/"
+                elif not meeting_url:
+                    log.info("Falling back to teams_chat_url from config.json.")
+
             teams_page = teams_ctx.new_page()
             teams = Teams(teams_page, cfg, log)
-            teams.open()
+            teams.open(meeting_url)
             if mode in ("run", "test-teams"):
                 teams.join_meeting()
 

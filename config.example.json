@@ -1,6 +1,7 @@
 {
-  "teams_chat_url": "https://teams.microsoft.com/v2/",
   "course_url": "https://lab.hrblock.com/lmt/",
+  "meeting_link_from_site": true,
+  "teams_chat_url": "",
 
   "trigger_pattern": "\\bpoll\\b\\s*(\\d+)?",
   "trigger_sender": "",

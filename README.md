@@ -30,11 +30,8 @@ API keys, no passwords stored.
      The `in_sessionid` part expires. That is fine: when it does, the bot beeps and you sign in
      and open the course page in its second tab by hand. The bot then uses whatever page that tab
      is on. Do not use the bare `https://lab.hrblock.com/lmt/` address, it returns a 404.
-   - `teams_chat_url`: the address of the place where the teacher posts "poll 1". If that is a
-     normal Teams chat, open <https://teams.microsoft.com/> in a browser, open the chat, and copy
-     the address bar. If it is the chat panel inside the class meeting, use the meeting join link
-     and the bot's first tab will open the meeting lobby. Join the meeting there (camera and mic
-     off) and open the Chat panel.
+   - `teams_chat_url`: leave empty. The bot gets the meeting link by clicking **Join** on the
+     course page at class time. Only fill this in if you want a fixed fallback link.
 5. Recommended: set `trigger_sender` to part of the teacher's display name, for example
    `"Crowley"`. Then a classmate typing "is poll 1 up yet?" does not trigger it.
 
@@ -53,11 +50,14 @@ Set `join_at` (24-hour clock, for example `"21:00"`) and `class_days` (for examp
 
 1. Start `run.bat` any time before class, or let the Startup shortcut start it at sign-in. The
    LMT window opens straight away so you can sign in early if it asks.
-2. At `join_at` on a class day the Teams window opens the meeting, types `display_name`,
-   switches camera and mic off, clicks **Join**, waits for admission, and opens the Chat panel.
-   Starting the bot late still joins, as long as it is within `session_hours` of `join_at`.
-3. It watches for polls as usual.
-4. When `goodbye_threshold` people say goodbye, it says goodbye, leaves, closes the Teams
+2. At `join_at` on a class day the bot clicks **Join** on today's session row of the course
+   page, takes the Teams link from the window that opens, and closes that window. If Join is
+   still greyed out it reloads and retries every 30 seconds.
+3. It opens that link in the private Teams window, types `display_name`, switches camera and
+   mic off, clicks **Join**, waits for admission, and opens the Chat panel. Starting the bot
+   late still joins, as long as it is within `session_hours` of `join_at`.
+4. It watches for polls as usual.
+5. When `goodbye_threshold` people say goodbye, it says goodbye, leaves, closes the Teams
    window, and waits for the next class day. It never rejoins a class it has already left.
 
 Leave `join_at` empty to go back to joining by hand. `auto_join` on its own joins immediately
@@ -137,7 +137,9 @@ Delete `state\site-storage.json` to force a fresh LMT sign-in. Teams never keeps
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `teams_chat_url` | | Address bar URL of the class chat in Teams on the web. |
+| `teams_chat_url` | `""` | Optional fixed meeting or chat link, used if the course page gives none. |
+| `meeting_link_from_site` | `true` | Click Join on the course page to get the meeting link. |
+| `meeting_link_pattern` | `teams\.` | What the link opened by Join must contain. |
 | `course_url` | | Address bar URL of the LMT course page. |
 | `trigger_pattern` | `\bpoll\b\s*(\d+)?` | Regular expression a message must match; group 1 is the poll number. |
 | `trigger_sender` | `""` | Only trigger on authors whose name contains this. Empty means anyone. |
